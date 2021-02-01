@@ -790,6 +790,117 @@ func TestJWTAccountBasicImportExport(t *testing.T) {
 	}
 }
 
+func TestJWTAccountExportActivationImport(t *testing.T) {
+	s := opTrustBasicSetup()
+	go s.Start()
+	defer s.Shutdown()
+	if !s.ReadyForConnections(5 * time.Second) {
+		t.Fatal("failed to start server")
+	}
+
+	buildMemAccResolver(s)
+	okp, err := nkeys.FromSeed(oSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accAPair, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accAPub, err := accAPair.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accAClaims := jwt.NewAccountClaims(accAPub)
+	accAClaims.Exports.Add(&jwt.Export{
+		Name:     "events.>",
+		Subject:  "events.>",
+		TokenReq: true,
+		Type:     jwt.Stream,
+	})
+	accAJWT, err := accAClaims.Encode(okp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addAccountToMemResolver(s, accAPub, accAJWT)
+
+	accBPair, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accBPub, err := accBPair.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	act := jwt.NewActivationClaims(accBPub)
+	act.ImportSubject = "events.tenant.>"
+	act.ImportType = jwt.Stream
+	actJWT, err := act.Encode(accAPair)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accBClaims := jwt.NewAccountClaims(accBPub)
+	accBClaims.Imports.Add(&jwt.Import{
+		Name:    "events.tenant.>",
+		Subject: "events.tenant.>",
+		Account: accAPub,
+		Token:   actJWT,
+		Type:    jwt.Stream,
+	})
+	accBJWT, err := accBClaims.Encode(okp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addAccountToMemResolver(s, accBPub, accBJWT)
+
+	ncA := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accAPair))
+	defer ncA.Close()
+
+	ncB := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accBPair))
+	defer ncB.Close()
+
+	okSubj := "events.tenant.foo"
+	badSubj := "some.random.subject"
+	var cnt int
+	var gotOKSubj, gotBadSubj bool
+	_, err = ncB.Subscribe(">", func(m *nats.Msg) {
+		cnt++
+		switch m.Subject {
+		case okSubj:
+			gotOKSubj = true
+		case badSubj:
+			gotBadSubj = true
+		default:
+			t.Fatalf("unexpected message subject: %s", m.Subject)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1 * time.Second)
+	if err := ncA.Publish(okSubj, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ncA.Publish(badSubj, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1 * time.Second)
+
+	if cnt == 0 {
+		t.Fatal("failed to receive any messages")
+	}
+	if !gotOKSubj {
+		t.Error("failed to receive ok subject")
+	}
+	if gotBadSubj {
+		t.Error("failed to block bad subject")
+	}
+}
+
 func TestJWTAccountExportWithResponseType(t *testing.T) {
 	s := opTrustBasicSetup()
 	defer s.Shutdown()
@@ -5373,7 +5484,7 @@ func TestJWTAccountProtectedImport(t *testing.T) {
 		require_NoError(t, err)
 		sysUsrCreds := newUserEx(t, sysAcc, false, sysPub)
 		defer os.Remove(sysUsrCreds)
-		cf := createConfFile(t, []byte(fmt.Sprintf(`		
+		cf := createConfFile(t, []byte(fmt.Sprintf(`
 		port: -1
 		operator = %s
 		system_account = %s
